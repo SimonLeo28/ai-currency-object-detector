@@ -3,149 +3,159 @@ import numpy as np
 import pyttsx3
 from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2, preprocess_input, decode_predictions
 from tensorflow.keras.preprocessing import image
+import os
+import glob
 
 # 1. INITIALIZE TOOLS
 # ==============================================================================
-# Initialize text-to-speech engine
 engine = pyttsx3.init()
+model_fallback = MobileNetV2(weights='imagenet')  # Renamed to avoid confusion
+orb = cv2.ORB_create(nfeatures=2000)
 
-# Load pretrained MobileNetV2 model for general object detection
-model = MobileNetV2(weights='imagenet')
-
-# Initialize the ORB feature detector
-orb = cv2.ORB_create(nfeatures=1000)
-
-# 2. PREPARE CURRENCY TEMPLATES
+# 2. DYNAMICALLY LOAD CURRENCY TEMPLATES
 # ==============================================================================
-# Paths to your template images
-currency_templates = {
-    "10": "currency/10.jpg",
-    "20": "currency/20.jpg",
-    "50": "currency/50.jpg",
-    "100": "currency/100.jpg",
-    "200": "currency/200.jpg",
-    "500": "currency/500.jpg"
+print("Loading currency template images...")
+
+# This dictionary maps folder names to the desired spoken output
+folder_to_label_map = {
+    "ten_new": "10 Rupee (New)",
+    "ten_old": "10 Rupee (Old)",
+    "twenty_new": "20 Rupee (New)",
+    "twenty_old": "20 Rupee (Old)",
+    "fifty_new": "50 Rupee (New)",
+    "fifty_old": "50 Rupee (Old)",
+    "hundred_new": "100 Rupee (New)",
+    "hundred_old": "100 Rupee (Old)",
+    "two_hundred": "200 Rupee",
+    "five_hundred": "500 Rupee",
+    "two_thousand": "2000 Rupee"
 }
 
-# Pre-load templates and compute their features (keypoints and descriptors)
-# This is done once at the start for efficiency
 currency_features = {}
-for denom, path in currency_templates.items():
-    template = cv2.imread(path, 0)
-    # Check if the image was loaded correctly
-    if template is None:
-        print(f"Warning: Could not load template image at {path}. Skipping.")
+# Loop through the folders we expect to find
+for folder_name in folder_to_label_map.keys():
+    # Initialize a list for this denomination's features
+    currency_features[folder_name] = []
+
+    # Find all image files in the corresponding folder
+    image_paths = glob.glob(os.path.join(folder_name, '*.jpg'))
+    image_paths.extend(glob.glob(os.path.join(folder_name, '*.jpeg')))
+    image_paths.extend(glob.glob(os.path.join(folder_name, '*.png')))
+
+    if not image_paths:
+        print(f"Warning: No images found in folder '{folder_name}'.")
         continue
-    kp, des = orb.detectAndCompute(template, None)
-    currency_features[denom] = {"kp": kp, "des": des}
+
+    # Process each image in the folder
+    for path in image_paths:
+        template = cv2.imread(path, 0)
+        if template is None:
+            print(f"Warning: Could not load template image at {path}. Skipping.")
+            continue
+
+        kp, des = orb.detectAndCompute(template, None)
+        if des is not None:
+            currency_features[folder_name].append({"kp": kp, "des": des, "img": template})
+
 print("Currency features loaded successfully.")
 
 
 # 3. DETECTION FUNCTIONS
 # ==============================================================================
-
 def detect_currency_with_features(frame):
-    """
-    Detects currency using ORB feature matching, which is robust to rotation and scale.
-    """
     gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     kp_frame, des_frame = orb.detectAndCompute(gray_frame, None)
 
-    # If no features are detected in the camera frame, we can't match anything
     if des_frame is None:
-        return None
+        return None, None
 
-    # Use a Brute-Force Matcher to find the best matches
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-
-    best_match_denom = None
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+    best_match_denom_folder = None
     max_good_matches = 0
+    best_match_info = None
 
-    # Loop through each of our pre-computed currency features
-    for denom, features in currency_features.items():
-        if features["des"] is None or len(features["des"]) < 2:
-            continue
+    for denom_folder, features_list in currency_features.items():
+        for features in features_list:
+            if features["des"] is None or len(features["des"]) < 2:
+                continue
 
-        # Match the descriptors from the template with the descriptors from the camera frame
-        matches = bf.match(features["des"], des_frame)
+            matches = bf.knnMatch(features["des"], des_frame, k=2)
+            good_matches = []
+            if matches and len(matches[0]) == 2:
+                for m, n in matches:
+                    if m.distance < 0.75 * n.distance:
+                        good_matches.append(m)
 
-        # Consider a match "good" if its distance is low (lower is better)
-        good_matches = [m for m in matches if m.distance < 70]  # You can tune this distance threshold
+            if len(good_matches) > max_good_matches:
+                max_good_matches = len(good_matches)
+                best_match_denom_folder = denom_folder
+                best_match_info = {
+                    "kp_template": features["kp"],
+                    "kp_frame": kp_frame,
+                    "good_matches": good_matches,
+                    "template_img": features["img"]
+                }
 
-        # If this currency has more good matches than any we've seen before,
-        # it becomes our new best candidate.
-        if len(good_matches) > max_good_matches:
-            max_good_matches = len(good_matches)
-            best_match_denom = denom
+    debug_image = None
+    if best_match_info and max_good_matches > 5:
+        debug_image = cv2.drawMatches(best_match_info["template_img"], best_match_info["kp_template"],
+                                      gray_frame, best_match_info["kp_frame"],
+                                      best_match_info["good_matches"], None,
+                                      flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
 
-    # Require a minimum number of good matches to be confident about the result
-    # This prevents false positives from random matches.
-    if max_good_matches > 20:  # You can tune this confidence threshold
-        return f"{best_match_denom} rupee note"
+    if max_good_matches > 15:
+        # Convert the folder name (e.g., "fifty_new") to a clean label
+        friendly_label = folder_to_label_map.get(best_match_denom_folder, "Unknown Currency")
+        return f"{friendly_label} note", debug_image
 
-    return None
+    return None, debug_image
 
 
 def detect_object(frame):
-    """
-    Fallback function to detect a general object using MobileNetV2.
-    """
     img = cv2.resize(frame, (224, 224))
     x = image.img_to_array(img)
     x = np.expand_dims(x, axis=0)
     x = preprocess_input(x)
-    preds = model.predict(x, verbose=0)  # verbose=0 hides the prediction progress bar
+    preds = model_fallback.predict(x, verbose=0)
     label = decode_predictions(preds, top=1)[0][0][1]
-    return label.replace("_", " ")  # Replace underscores with spaces for better speech
+    return label.replace("_", " ")
 
 
 # 4. HELPER AND MAIN LOOP
 # ==============================================================================
-
 def speak(text):
-    """
-    Converts text to speech.
-    """
     print(f"Speaking: {text}")
     engine.say(text)
     engine.runAndWait()
 
 
-# Open the default webcam
 cap = cv2.VideoCapture(0)
-
 print("\nCamera is active. Press 's' to scan for an object or 'q' to quit.")
 
 while True:
     ret, frame = cap.read()
     if not ret:
-        print("Error: Could not read frame from camera.")
         break
 
-    # Display the camera feed in a window
-    cv2.imshow("Object Detector - Press 's' to scan, 'q' to quit", frame)
+    cv2.imshow("Object Detector", frame)
     key = cv2.waitKey(1) & 0xFF
 
-    # If the 's' key is pressed, run the detection logic
     if key == ord('s'):
         print("\nScanning...")
-        # First, try to detect a currency note using our robust feature matcher
-        result = detect_currency_with_features(frame)
+        result, debug_frame = detect_currency_with_features(frame)
 
-        # If a currency was found, announce it
+        if debug_frame is not None:
+            cv2.imshow("Debug View - Feature Matches", debug_frame)
+
         if result:
             speak(f"I think this is a {result}")
-        # Otherwise, fall back to the general object detector
         else:
             print("No currency detected, trying general object detection...")
             obj = detect_object(frame)
             speak(f"This looks like a {obj}")
 
-    # If the 'q' key is pressed, break the loop and exit
     elif key == ord('q'):
-        print("Quitting...")
         break
 
-# Clean up and close everything
 cap.release()
 cv2.destroyAllWindows()
